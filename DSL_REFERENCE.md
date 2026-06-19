@@ -16,6 +16,26 @@ planner = Planner(domain.actions)
 plan = planner.plan(domain.worlds["initial"], domain.goals["build_a_house"])
 ```
 
+Plans can be executed with callbacks:
+
+```python
+from action_py import ExecutionStatus, PlanExecutor
+
+if plan is None:
+    raise RuntimeError("No plan found")
+
+executor = PlanExecutor(plan, domain.worlds["initial"])
+
+def start_chop_tree(context):
+    # Start the real operation here: send a robot command, call a service,
+    # schedule an animation, enqueue a job, etc.
+    return ExecutionStatus.RUNNING
+
+executor.on_start("chop_tree", start_chop_tree)
+
+status = executor.tick()
+```
+
 You can also compile from a string:
 
 ```python
@@ -601,6 +621,195 @@ This compiles to 18 grounded actions:
 - 6 `stack(...,...)`
 - 6 `unstack(...,...)`
 
+## Executing Plans
+
+The DSL defines planning domains. Execution is handled by the Python runtime:
+compile a domain, ask a planner for a `Plan`, then tick a `PlanExecutor`.
+
+```python
+from action_py import ExecutionStatus, PlanExecutor, Planner
+from action_py.dsl import load_domain
+
+domain = load_domain("build_house.goap")
+initial = domain.worlds["initial"]
+goal = domain.goals["build_a_house"]
+
+plan = Planner(domain.actions).plan(initial, goal)
+if plan is None:
+    raise RuntimeError("No plan found")
+
+executor = PlanExecutor(plan, initial)
+```
+
+`PlanExecutor` is a small BehaviorTree.CPP-style executor. It advances one
+action at a time and returns one of:
+
+```python
+ExecutionStatus.SUCCESS
+ExecutionStatus.RUNNING
+ExecutionStatus.FAILED
+```
+
+`ExecutionStatus.FAILURE` and the string `"failure"` are accepted aliases for
+`FAILED`.
+
+### Start Callbacks
+
+Register callbacks by compiled action name:
+
+```python
+def start_go_to_forest(context):
+    print(f"starting {context.action.name}")
+    return ExecutionStatus.SUCCESS
+
+executor.on_start("go_to_forest", start_go_to_forest)
+```
+
+The callback is called when that action becomes active. The `context` contains:
+
+```python
+context.action   # Action being executed
+context.index    # index in the plan
+context.belief   # executor's current WorldState belief
+```
+
+If an action has no callback, the executor treats it as immediately successful.
+On success, the action's declared DSL effects are applied to the executor
+belief.
+
+### Running Actions
+
+Return `RUNNING` for actions that take more than one tick:
+
+```python
+def start_chop_tree(context):
+    send_robot_command("chop_tree")
+    return ExecutionStatus.RUNNING
+
+executor.on_start("chop_tree", start_chop_tree)
+```
+
+While an action is running, repeated `tick()` calls keep returning `RUNNING`
+unless an `on_running` callback is registered:
+
+```python
+def poll_chop_tree(context):
+    if robot_command_done("chop_tree"):
+        return context.success()
+    return context.running()
+
+executor.on_running("chop_tree", poll_chop_tree)
+```
+
+External code can also complete the active action:
+
+```python
+executor.complete_current(
+    ExecutionStatus.SUCCESS,
+    facts={"tree_sensor_confirmed": True},
+)
+```
+
+### Belief Updates
+
+The executor keeps its own `belief` as a `WorldState`. This is separate from
+the original world object, because `WorldState` snapshots are immutable.
+
+On successful action completion:
+
+1. The action's declared effects are applied to `executor.belief`.
+2. Observed facts returned by the callback are merged after the model effects.
+
+This means real observations can override expected effects:
+
+```python
+def inspect_door(context):
+    return context.success(facts={
+        "door_open": False,
+        "door_jammed": True,
+    })
+
+executor.on_start("inspect_door", inspect_door)
+```
+
+Callbacks can also update belief while running or failing:
+
+```python
+def open_door(context):
+    return context.failed(facts={"door_blocked": True})
+```
+
+These observed facts are useful for future replanning: when execution fails,
+you can pass `executor.belief` back to a planner as the new starting state.
+
+You can manually merge observations at any time:
+
+```python
+executor.update_belief({"battery_low": True})
+```
+
+or replace the belief snapshot:
+
+```python
+executor.update_belief(belief=new_world_state)
+```
+
+### Callback Return Values
+
+Callbacks may return:
+
+```python
+ExecutionStatus.SUCCESS
+ExecutionStatus.RUNNING
+ExecutionStatus.FAILED
+"success"
+"running"
+"failed"
+None
+```
+
+Returning `None` means `RUNNING`, which is useful for callbacks that only start
+an asynchronous action.
+
+For observed facts or a full belief replacement, return an `ActionResult` or
+use the helper methods on `ExecutionContext`:
+
+```python
+return context.success(facts={"has_wood": True})
+return context.running(facts={"saw_tree": True})
+return context.failed(facts={"axe_broken": True})
+```
+
+A complete callback example:
+
+```python
+def start_buy_nails(context):
+    if context.belief.get("shop_open") is not True:
+        return context.failed(facts={"needs_shop_open": True})
+    order_nails()
+    return context.running()
+
+def poll_buy_nails(context):
+    if nails_arrived():
+        return context.success(facts={"receipt_id": "N-123"})
+    return context.running()
+
+executor.on_start("buy_nails", start_buy_nails)
+executor.on_running("buy_nails", poll_buy_nails)
+```
+
+A simple execution loop:
+
+```python
+while True:
+    status = executor.tick()
+    if status == ExecutionStatus.SUCCESS:
+        break
+    if status == ExecutionStatus.FAILED:
+        # Future replanning can start from executor.belief.
+        break
+```
+
 ## Python API
 
 ### `parse_domain(source)`
@@ -644,6 +853,68 @@ from action_py.dsl import load_domain
 
 domain = load_domain("blocksworld.goap")
 ```
+
+### `PlanExecutor(plan, belief, callbacks=None)`
+
+Executes a `Plan` returned by a planner.
+
+```python
+from action_py import PlanExecutor
+
+executor = PlanExecutor(plan, initial_world)
+```
+
+Important attributes:
+
+```python
+executor.belief          # current WorldState belief
+executor.index           # current action index
+executor.current_action  # active or next Action, or None
+executor.is_running      # True while an action is active
+executor.is_done         # True when all actions completed
+```
+
+Important methods:
+
+```python
+executor.on_start(action_name, callback)
+executor.on_running(action_name, callback)
+executor.tick()
+executor.complete_current(status, facts=None, belief=None)
+executor.update_belief(facts)
+executor.reset(belief=None)
+```
+
+`BTExecutor` and `BehaviorTreeExecutor` are aliases for `PlanExecutor`.
+
+### `ExecutionStatus`
+
+Executor result enum:
+
+```python
+ExecutionStatus.SUCCESS
+ExecutionStatus.RUNNING
+ExecutionStatus.FAILED
+```
+
+Each status has a lowercase string value: `"success"`, `"running"`, or
+`"failed"`.
+
+### `ActionResult(status, facts=None, belief=None, apply_effects=True)`
+
+Detailed callback result.
+
+Use `facts` for observed fact updates:
+
+```python
+return ActionResult(ExecutionStatus.SUCCESS, facts={"has_wood": True})
+```
+
+Use `belief` to replace the executor belief with a full `WorldState`.
+
+When a result succeeds, `apply_effects=True` applies the action's declared DSL
+effects before merging observed facts. Set it to `False` if the callback
+already returns the complete observed state.
 
 ### Custom Fact Encoding
 
@@ -765,4 +1036,3 @@ Not supported in V1:
 - tabs for indentation
 - runtime `where` predicates
 - object inheritance or tags
-
