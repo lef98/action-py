@@ -19,6 +19,15 @@ from action_py.core import (
     facts,
 )
 from action_py.planning import Planner, AStarPlanner
+from action_py.execution import (
+    ActionCallback,
+    ActionResult,
+    BTExecutor,
+    BehaviorTreeExecutor,
+    ExecutionContext,
+    ExecutionStatus,
+    PlanExecutor,
+)
 
 __all__ = [
     "Action",
@@ -37,6 +46,13 @@ __all__ = [
     "WorldState",
     "Planner",
     "AStarPlanner",
+    "ActionCallback",
+    "ActionResult",
+    "BTExecutor",
+    "BehaviorTreeExecutor",
+    "ExecutionContext",
+    "ExecutionStatus",
+    "PlanExecutor",
     "fact",
     "facts",
 ]
