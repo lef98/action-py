@@ -3,6 +3,7 @@ from action_py import (
     Goal,
     WorldState,
     Planner,
+    AStarPlanner,
     fact,
     facts,
     AndCondition,
@@ -265,3 +266,112 @@ class TestPlanner:
         plan = planner.plan(state, goal, seed=42)
         assert plan is not None
         assert plan.total_cost == len(plan.actions)
+
+
+class TestAStarPlanner:
+    def test_finds_lowest_cost_plan(self):
+        direct = Action(
+            name="direct",
+            preconditions=EQ("start"),
+            effects=SET("done", True),
+            cost=10,
+        )
+        make_mid = Action(
+            name="make_mid",
+            preconditions=EQ("start"),
+            effects=SET("mid", True),
+            cost=1,
+        )
+        finish = Action(
+            name="finish",
+            preconditions=EQ("mid"),
+            effects=SET("done", True),
+            cost=1,
+        )
+
+        planner = AStarPlanner(actions=[direct, make_mid, finish])
+        plan = planner.plan(
+            WorldState({"start": True}),
+            Goal(name="done", condition=EQ("done")),
+        )
+
+        assert plan is not None
+        assert [action.name for action in plan] == ["make_mid", "finish"]
+        assert plan.total_cost == 2
+
+    def test_cost_function_can_use_state_transition(self):
+        direct = Action(
+            name="direct",
+            preconditions=EQ("start"),
+            effects=SET("done", True),
+            cost=1,
+        )
+        make_mid = Action(
+            name="make_mid",
+            preconditions=EQ("start"),
+            effects=SET("mid", True),
+            cost=1,
+        )
+        finish = Action(
+            name="finish",
+            preconditions=EQ("mid"),
+            effects=SET("done", True),
+            cost=1,
+        )
+
+        def cost_fn(action, from_state, to_state):
+            assert from_state is not to_state
+            if action.name == "direct":
+                return 10
+            return action.cost
+
+        planner = AStarPlanner(
+            actions=[direct, make_mid, finish],
+            cost_fn=cost_fn,
+        )
+        plan = planner.plan(
+            WorldState({"start": True}),
+            Goal(name="done", condition=EQ("done")),
+        )
+
+        assert plan is not None
+        assert [action.name for action in plan] == ["make_mid", "finish"]
+
+    def test_structured_state_values_can_be_tracked(self):
+        gather = Action(
+            name="gather",
+            preconditions=EQ("start"),
+            effects=DO(
+                SET("inventory", ["wood"]),
+                SET("done", True),
+            ),
+        )
+
+        planner = AStarPlanner(actions=[gather])
+        plan = planner.plan(
+            WorldState({"start": True, "inventory": []}),
+            Goal(name="done", condition=EQ("done")),
+        )
+
+        assert plan is not None
+        assert [action.name for action in plan] == ["gather"]
+
+    def test_rejects_negative_action_costs(self):
+        action = Action(
+            name="bad",
+            preconditions=EQ("start"),
+            effects=SET("done", True),
+            cost=-1,
+        )
+
+        planner = AStarPlanner(actions=[action])
+
+        try:
+            planner.plan(
+                WorldState({"start": True}),
+                Goal(name="done", condition=EQ("done")),
+            )
+        except ValueError as exc:
+            assert "non-negative finite cost" in str(exc)
+        else:
+            raise AssertionError("negative costs must be rejected")
